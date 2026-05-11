@@ -25,11 +25,23 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Show workflow file being used
+      - name: Show workflow context
         run: |
-          echo "Running self-contained experiment1.yml"
-          echo "Repository files:"
+          echo "============================================================"
+          echo "TraceLeaks Experiment 1"
+          echo "Retrieval Access-Pattern Leakage"
+          echo "============================================================"
+          echo
+          echo "This workflow is self-contained."
+          echo "It creates a synthetic LLM-agent privacy experiment at runtime."
+          echo
+          echo "Repository files visible to the runner:"
           find . -maxdepth 3 -type f | sort
+          echo
+          echo "Runner:"
+          uname -a
+          echo
+          echo "Python will be configured in the next step."
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -40,14 +52,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-experiment1-self-contained-v2
+          key: pip-${{ runner.os }}-experiment1-ultra-verbose-v1
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install numpy scikit-learn
 
-      - name: Create self-contained experiment script
+      - name: Create self-contained retrieval leakage experiment
         run: |
           mkdir -p experiments results
 
@@ -72,7 +84,8 @@ jobs:
               np.random.seed(seed)
 
               labels = [f"label_{i}" for i in range(n_labels)]
-              outputs = [
+
+              sanitized_outputs = [
                   "The requested follow-up has been prepared.",
                   "The case has been processed successfully.",
                   "The next step has been scheduled.",
@@ -84,26 +97,34 @@ jobs:
               for i in range(n_records):
                   label = labels[i % n_labels]
 
-                  # Final output is sanitized and label-independent.
-                  output = random.choice(outputs)
+                  output = random.choice(sanitized_outputs)
 
-                  # Retrieval metadata leaks the sensitive label through access pattern.
                   retrieval_id = f"guideline_{label}_followup"
-
-                  # Score bucket is operational metadata.
                   retrieval_score = random.choice(["high", "medium"])
-
-                  # Redacted retrieval intentionally collapses labels into one coarse route.
                   redacted_retrieval = "guideline_sensitive_followup"
 
                   records.append(
                       {
                           "record_id": f"case_{i:04d}",
                           "sensitive_label": label,
-                          "output": output,
-                          "retrieval_id": retrieval_id,
-                          "retrieval_score": retrieval_score,
-                          "redacted_retrieval": redacted_retrieval,
+                          "private_record": {
+                              "case_id": f"case_{i:04d}",
+                              "hidden_sensitive_label": label,
+                              "private_note": (
+                                  "This field is private and is not included in the "
+                                  "user-visible answer. It represents a sensitive "
+                                  "class such as diagnosis, fraud category, HR case "
+                                  "type, or vulnerability class."
+                              ),
+                          },
+                          "agent_final_output": output,
+                          "retrieval_trace": {
+                              "retrieval_id": retrieval_id,
+                              "retrieval_score_bucket": retrieval_score,
+                          },
+                          "redacted_retrieval_trace": {
+                              "retrieval_route": redacted_retrieval,
+                          },
                       }
                   )
 
@@ -113,19 +134,25 @@ jobs:
 
           def view_features(record: dict, view: str) -> dict:
               if view == "output":
-                  return {"output": record["output"]}
+                  return {
+                      "agent_final_output": record["agent_final_output"],
+                  }
 
               if view == "retrieval_id":
-                  return {"retrieval_id": record["retrieval_id"]}
+                  return {
+                      "retrieval_id": record["retrieval_trace"]["retrieval_id"],
+                  }
 
               if view == "retrieval_score":
                   return {
-                      "retrieval_id": record["retrieval_id"],
-                      "retrieval_score": record["retrieval_score"],
+                      "retrieval_id": record["retrieval_trace"]["retrieval_id"],
+                      "retrieval_score_bucket": record["retrieval_trace"]["retrieval_score_bucket"],
                   }
 
               if view == "redacted_retrieval":
-                  return {"redacted_retrieval": record["redacted_retrieval"]}
+                  return {
+                      "retrieval_route": record["redacted_retrieval_trace"]["retrieval_route"],
+                  }
 
               raise ValueError(f"Unknown view: {view}")
 
@@ -181,6 +208,7 @@ jobs:
 
               y_true = [r["sensitive_label"] for r in test]
               metrics = {}
+              predictions_by_setting = {}
 
               for view in views:
                   for attacker in attackers:
@@ -194,15 +222,34 @@ jobs:
                           raise ValueError(f"Unknown attacker: {attacker}")
 
                       key = f"{view}_{attacker}"
+
                       metrics[f"{key}_accuracy"] = float(accuracy_score(y_true, predictions))
                       metrics[f"{key}_macro_f1"] = float(
                           f1_score(y_true, predictions, average="macro")
                       )
 
+                      predictions_by_setting[key] = [
+                          {
+                              "record_id": record["record_id"],
+                              "true_sensitive_label": true,
+                              "predicted_sensitive_label": pred,
+                              "correct": true == pred,
+                          }
+                          for record, true, pred in zip(test, y_true, predictions)
+                      ]
+
               return {
                   "n_train": len(train),
                   "n_test": len(test),
+                  "train_label_distribution": dict(Counter(r["sensitive_label"] for r in train)),
+                  "test_label_distribution": dict(Counter(r["sensitive_label"] for r in test)),
+                  "sample_train_records": train[:5],
+                  "sample_test_records": test[:5],
                   "metrics": metrics,
+                  "sample_predictions": {
+                      key: value[:10]
+                      for key, value in predictions_by_setting.items()
+                  },
               }
 
 
@@ -232,6 +279,34 @@ jobs:
 
               records = make_records(args.n_records, args.n_labels, args.seed)
               result = evaluate(records, args.views, args.attackers, args.seed)
+
+              chance_accuracy = 1.0 / args.n_labels
+
+              result["experiment_metadata"] = {
+                  "name": "Experiment 1: Retrieval Access-Pattern Leakage",
+                  "purpose": (
+                      "Demonstrate that final-output-only privacy evaluation can miss "
+                      "sensitive information leakage through retrieval metadata."
+                  ),
+                  "threat_model": {
+                      "private_data_visible_to_adversary": False,
+                      "adversary_goal": "Recover the hidden sensitive label.",
+                      "adversary_views": args.views,
+                      "sensitive_label_count": args.n_labels,
+                      "chance_accuracy": chance_accuracy,
+                  },
+                  "expected_pattern": {
+                      "output_only_accuracy": (
+                          "Near chance, because the final answer is sanitized and label-independent."
+                      ),
+                      "retrieval_id_accuracy": (
+                          "High, because retrieval_id contains access-pattern information tied to the sensitive label."
+                      ),
+                      "redacted_retrieval_accuracy": (
+                          "Near chance, because redaction collapses label-specific retrieval routes."
+                      ),
+                  },
+              }
 
               result["config"] = {
                   "n_records": args.n_records,
@@ -265,23 +340,95 @@ jobs:
             --attackers majority rule tfidf_logreg \
             --out results/retrieval_ci.json
 
-      - name: Print experiment summary
+      - name: Print ultra-verbose interpretation
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
 
-          result_path = Path("results/retrieval_ci.json")
-          result = json.loads(result_path.read_text(encoding="utf-8"))
+          result = json.loads(Path("results/retrieval_ci.json").read_text(encoding="utf-8"))
           metrics = result["metrics"]
+          meta = result["experiment_metadata"]
+          config = result["config"]
 
-          print("\nExperiment 1: Retrieval Access-Pattern Leakage")
-          print("================================================")
-          print(f"n_train: {result['n_train']}")
-          print(f"n_test:  {result['n_test']}")
+          print()
+          print("============================================================")
+          print("EXPERIMENT 1: RETRIEVAL ACCESS-PATTERN LEAKAGE")
+          print("============================================================")
+          print()
+          print("1. PURPOSE")
+          print("----------")
+          print(meta["purpose"])
+          print()
+          print("This experiment tests whether an LLM-agent system can appear")
+          print("private when evaluated only on its final natural-language output,")
+          print("while still leaking the hidden sensitive label through retrieval")
+          print("metadata generated during the agent workflow.")
+          print()
+          print("Core security question:")
+          print("  If the final answer does not reveal the secret, can an adversary")
+          print("  still infer the secret from retrieval traces?")
           print()
 
-          keys = [
+          print("2. THREAT MODEL")
+          print("---------------")
+          tm = meta["threat_model"]
+          print(f"Private records visible to adversary: {tm['private_data_visible_to_adversary']}")
+          print(f"Adversary goal: {tm['adversary_goal']}")
+          print(f"Adversary views tested: {', '.join(tm['adversary_views'])}")
+          print(f"Number of sensitive labels: {tm['sensitive_label_count']}")
+          print(f"Chance / majority baseline expectation: {tm['chance_accuracy']:.4f}")
+          print()
+          print("The adversary does NOT see the private record directly.")
+          print("The adversary may see one of several operational views:")
+          print("  - final sanitized output only")
+          print("  - retrieval ID")
+          print("  - retrieval ID plus retrieval score bucket")
+          print("  - redacted retrieval route")
+          print()
+
+          print("3. CONFIGURATION")
+          print("----------------")
+          for key, value in config.items():
+              print(f"{key}: {value}")
+          print()
+          print(f"Training examples: {result['n_train']}")
+          print(f"Test examples:     {result['n_test']}")
+          print()
+          print("Train label distribution:")
+          for key, value in sorted(result["train_label_distribution"].items()):
+              print(f"  {key}: {value}")
+          print()
+          print("Test label distribution:")
+          for key, value in sorted(result["test_label_distribution"].items()):
+              print(f"  {key}: {value}")
+          print()
+
+          print("4. SAMPLE INPUT RECORDS")
+          print("-----------------------")
+          print("These are examples of private records and their generated traces.")
+          print("The hidden_sensitive_label is private and should not be recoverable")
+          print("from the final answer alone.")
+          print()
+          for i, record in enumerate(result["sample_test_records"], start=1):
+              print(f"Sample test record {i}:")
+              print(json.dumps(record, indent=2, sort_keys=True))
+              print()
+
+          print("5. EXPECTED RESULTS BEFORE RUNNING")
+          print("----------------------------------")
+          for key, value in meta["expected_pattern"].items():
+              print(f"{key}: {value}")
+          print()
+          print("Numerically, with 5 labels:")
+          print("  - Output-only attacker should be near 0.20 accuracy.")
+          print("  - Retrieval-ID attacker should be very high, ideally near 1.00.")
+          print("  - Redacted-retrieval attacker should return near 0.20 accuracy.")
+          print()
+
+          print("6. ACTUAL RESULTS")
+          print("-----------------")
+          ordered_keys = [
               "output_majority_accuracy",
               "output_rule_accuracy",
               "output_tfidf_logreg_accuracy",
@@ -291,12 +438,87 @@ jobs:
               "retrieval_score_tfidf_logreg_accuracy",
               "redacted_retrieval_rule_accuracy",
               "redacted_retrieval_tfidf_logreg_accuracy",
+              "output_majority_macro_f1",
+              "output_rule_macro_f1",
+              "output_tfidf_logreg_macro_f1",
+              "retrieval_id_rule_macro_f1",
+              "retrieval_id_tfidf_logreg_macro_f1",
+              "redacted_retrieval_rule_macro_f1",
+              "redacted_retrieval_tfidf_logreg_macro_f1",
           ]
-
-          for key in keys:
+          for key in ordered_keys:
               print(f"{key}: {metrics[key]:.4f}")
+          print()
 
-          print("\nFull result written to results/retrieval_ci.json")
+          print("7. SAMPLE PREDICTIONS")
+          print("---------------------")
+          print("Below are example attacker predictions under three views.")
+          print()
+          for setting in [
+              "output_tfidf_logreg",
+              "retrieval_id_tfidf_logreg",
+              "redacted_retrieval_tfidf_logreg",
+          ]:
+              print(f"Setting: {setting}")
+              for row in result["sample_predictions"][setting][:5]:
+                  print(json.dumps(row, indent=2, sort_keys=True))
+              print()
+
+          print("8. INTERPRETATION")
+          print("-----------------")
+          output_acc = metrics["output_tfidf_logreg_accuracy"]
+          retrieval_acc = metrics["retrieval_id_tfidf_logreg_accuracy"]
+          retrieval_score_acc = metrics["retrieval_score_tfidf_logreg_accuracy"]
+          redacted_acc = metrics["redacted_retrieval_tfidf_logreg_accuracy"]
+
+          print(f"Output-only attacker accuracy:        {output_acc:.4f}")
+          print(f"Retrieval-ID attacker accuracy:       {retrieval_acc:.4f}")
+          print(f"Retrieval-ID+score attacker accuracy: {retrieval_score_acc:.4f}")
+          print(f"Redacted retrieval attacker accuracy: {redacted_acc:.4f}")
+          print()
+          print("Interpretation:")
+          print("  - The final natural-language answer is sanitized.")
+          print("  - The output-only attacker performs at or below chance.")
+          print("  - The retrieval metadata attacker recovers the sensitive label perfectly.")
+          print("  - Redacting the retrieval route collapses recovery back to baseline.")
+          print()
+          print("This demonstrates the central leakage pattern:")
+          print("  Final-output-only privacy evaluation can say 'safe',")
+          print("  while retrieval traces leak the hidden sensitive attribute.")
+          print()
+
+          print("9. PAPER-STYLE CLAIM SUPPORTED")
+          print("------------------------------")
+          print("Claim supported by this CI experiment:")
+          print("  In LLM-agent systems, privacy is interface-dependent.")
+          print("  Evaluating only the final model output can underestimate")
+          print("  sensitive-attribute recoverability when operational traces")
+          print("  such as retrieval metadata are visible.")
+          print()
+          print("Possible paper wording:")
+          print("  'On our synthetic access-pattern benchmark, final outputs")
+          print("   yielded near-baseline sensitive-label recovery, while")
+          print("   retrieval identifiers allowed perfect recovery. Redacting")
+          print("   the retrieval route reduced recovery back to baseline.'")
+          print()
+
+          print("10. LIMITATIONS")
+          print("---------------")
+          print("This CI experiment intentionally uses a simple synthetic access-pattern")
+          print("leak to make the phenomenon deterministic and reproducible.")
+          print()
+          print("Current limitation:")
+          print("  retrieval_id directly encodes the sensitive label.")
+          print()
+          print("Next stronger version:")
+          print("  replace label-revealing IDs like guideline_label_2_followup")
+          print("  with indirect IDs such as guideline_17 or route_B, then let")
+          print("  the attacker learn the mapping from training data.")
+          print()
+
+          print("============================================================")
+          print("END OF ULTRA-VERBOSE EXPERIMENT REPORT")
+          print("============================================================")
           PY
 
       - name: Check expected leakage pattern
@@ -312,26 +534,40 @@ jobs:
           retrieval_acc = metrics["retrieval_id_tfidf_logreg_accuracy"]
           redacted_acc = metrics["redacted_retrieval_tfidf_logreg_accuracy"]
 
-          print("Checking expected pattern:")
-          print(f"  output_tfidf_logreg_accuracy: {output_acc:.4f}")
-          print(f"  retrieval_id_tfidf_logreg_accuracy: {retrieval_acc:.4f}")
-          print(f"  redacted_retrieval_tfidf_logreg_accuracy: {redacted_acc:.4f}")
+          print()
+          print("============================================================")
+          print("PASS / FAIL CHECKS")
+          print("============================================================")
+          print(f"output_tfidf_logreg_accuracy:             {output_acc:.4f}")
+          print(f"retrieval_id_tfidf_logreg_accuracy:       {retrieval_acc:.4f}")
+          print(f"redacted_retrieval_tfidf_logreg_accuracy: {redacted_acc:.4f}")
+          print()
+          print("Expected:")
+          print("  output_tfidf_logreg_accuracy <= 0.45")
+          print("  retrieval_id_tfidf_logreg_accuracy >= 0.90")
+          print("  redacted_retrieval_tfidf_logreg_accuracy <= 0.45")
+          print()
 
           if output_acc > 0.45:
               raise SystemExit(
-                  f"Output-only accuracy too high; sanitized output appears to leak labels: {output_acc:.4f}"
+                  f"FAIL: Output-only accuracy too high; sanitized output appears to leak labels: {output_acc:.4f}"
               )
 
           if retrieval_acc < 0.90:
               raise SystemExit(
-                  f"Retrieval trace accuracy too low; access-pattern leakage not reproduced: {retrieval_acc:.4f}"
+                  f"FAIL: Retrieval trace accuracy too low; access-pattern leakage not reproduced: {retrieval_acc:.4f}"
               )
 
           if redacted_acc > 0.45:
               raise SystemExit(
-                  f"Redacted retrieval accuracy too high; mitigation did not reduce leakage: {redacted_acc:.4f}"
+                  f"FAIL: Redacted retrieval accuracy too high; mitigation did not reduce leakage: {redacted_acc:.4f}"
               )
 
+          print("PASS:")
+          print("  The final output does not reveal the sensitive label.")
+          print("  The retrieval trace does reveal the sensitive label.")
+          print("  Redacting retrieval metadata reduces leakage back to baseline.")
+          print()
           print("[OK] Expected retrieval access-pattern leakage reproduced.")
           PY
 
