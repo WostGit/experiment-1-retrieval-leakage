@@ -1,4 +1,4 @@
-name: experiment-1-retrieval-leakage
+name: experiment-1-retrieval-leakage-clear
 
 on:
   push:
@@ -11,37 +11,59 @@ on:
 
 jobs:
   retrieval-leakage:
-    name: Run Experiment 1 - Retrieval Access-Pattern Leakage
+    name: Run Experiment 1 - Clear Retrieval Leakage Demo
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     env:
       PYTHONHASHSEED: "0"
-      TOKENIZERS_PARALLELISM: "false"
-      TRACELEAKS_CI: "1"
       TRACELEAKS_SEED: "1337"
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Show workflow context
+      - name: Explain experiment before running
         run: |
-          echo "============================================================"
-          echo "TraceLeaks Experiment 1"
-          echo "Retrieval Access-Pattern Leakage"
-          echo "============================================================"
+          echo "========================================================================"
+          echo "EXPERIMENT 1: RETRIEVAL ACCESS-PATTERN LEAKAGE"
+          echo "========================================================================"
           echo
-          echo "This workflow is self-contained."
-          echo "It creates a synthetic LLM-agent privacy experiment at runtime."
+          echo "This experiment shows one simple privacy failure:"
           echo
-          echo "Repository files visible to the runner:"
-          find . -maxdepth 3 -type f | sort
+          echo "  The final LLM answer can hide the secret,"
+          echo "  but the internal retrieval log can still reveal the secret."
           echo
-          echo "Runner:"
-          uname -a
+          echo "Example:"
           echo
-          echo "Python will be configured in the next step."
+          echo "  Hidden secret label:"
+          echo "    label_1"
+          echo
+          echo "  Final answer shown to user:"
+          echo "    The follow-up has been scheduled."
+          echo
+          echo "  Internal retrieval log:"
+          echo "    route_B_30"
+          echo
+          echo "The final answer does not say label_1."
+          echo "But if route_B_30 usually appears for label_1 cases,"
+          echo "then the route leaks the secret."
+          echo
+          echo "The experiment compares three attacker views:"
+          echo
+          echo "  1. Final answer only"
+          echo "     Expected: attacker fails."
+          echo
+          echo "  2. Retrieval route"
+          echo "     Expected: attacker succeeds."
+          echo
+          echo "  3. Redacted retrieval route"
+          echo "     Expected: attacker fails again."
+          echo
+          echo "Security lesson:"
+          echo "  Privacy must be evaluated over logs and metadata,"
+          echo "  not only over the final answer."
+          echo "========================================================================"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -52,14 +74,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-experiment1-ultra-verbose-v1
+          key: pip-${{ runner.os }}-experiment1-clear-v1
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install numpy scikit-learn
 
-      - name: Create self-contained retrieval leakage experiment
+      - name: Create experiment script
         run: |
           mkdir -p experiments results
 
@@ -75,17 +97,25 @@ jobs:
           import numpy as np
           from sklearn.feature_extraction import DictVectorizer
           from sklearn.linear_model import LogisticRegression
-          from sklearn.metrics import accuracy_score, f1_score
+          from sklearn.metrics import accuracy_score
           from sklearn.model_selection import train_test_split
 
 
-          def make_records(n_records: int, n_labels: int, seed: int) -> list[dict]:
+          def make_route_mapping(n_labels: int) -> dict[str, str]:
+              return {
+                  f"label_{i}": f"route_{chr(65 + i)}_{17 + i * 13}"
+                  for i in range(n_labels)
+              }
+
+
+          def make_records(n_records: int, n_labels: int, seed: int) -> tuple[list[dict], dict[str, str]]:
               random.seed(seed)
               np.random.seed(seed)
 
               labels = [f"label_{i}" for i in range(n_labels)]
+              route_mapping = make_route_mapping(n_labels)
 
-              sanitized_outputs = [
+              generic_final_answers = [
                   "The requested follow-up has been prepared.",
                   "The case has been processed successfully.",
                   "The next step has been scheduled.",
@@ -95,161 +125,117 @@ jobs:
               records = []
 
               for i in range(n_records):
-                  label = labels[i % n_labels]
-
-                  output = random.choice(sanitized_outputs)
-
-                  retrieval_id = f"guideline_{label}_followup"
-                  retrieval_score = random.choice(["high", "medium"])
-                  redacted_retrieval = "guideline_sensitive_followup"
+                  secret_label = labels[i % n_labels]
+                  final_answer = random.choice(generic_final_answers)
+                  retrieval_route = route_mapping[secret_label]
 
                   records.append(
                       {
                           "record_id": f"case_{i:04d}",
-                          "sensitive_label": label,
-                          "private_record": {
-                              "case_id": f"case_{i:04d}",
-                              "hidden_sensitive_label": label,
-                              "private_note": (
-                                  "This field is private and is not included in the "
-                                  "user-visible answer. It represents a sensitive "
-                                  "class such as diagnosis, fraud category, HR case "
-                                  "type, or vulnerability class."
-                              ),
-                          },
-                          "agent_final_output": output,
-                          "retrieval_trace": {
-                              "retrieval_id": retrieval_id,
-                              "retrieval_score_bucket": retrieval_score,
-                          },
-                          "redacted_retrieval_trace": {
-                              "retrieval_route": redacted_retrieval,
-                          },
+
+                          # This is the private secret.
+                          # The attacker should not directly see this.
+                          "secret_label": secret_label,
+
+                          # This is the final answer the user sees.
+                          # It is generic and does not contain the secret label.
+                          "final_answer": final_answer,
+
+                          # This is internal metadata.
+                          # It does not literally say label_1, label_2, etc.,
+                          # but it is correlated with the secret label.
+                          "retrieval_route": retrieval_route,
+
+                          # This is the mitigated/redacted version.
+                          # Every secret label maps to the same generic route.
+                          "redacted_retrieval_route": "route_sensitive_generic",
                       }
                   )
 
               random.shuffle(records)
-              return records
+              return records, route_mapping
 
 
-          def view_features(record: dict, view: str) -> dict:
-              if view == "output":
-                  return {
-                      "agent_final_output": record["agent_final_output"],
-                  }
+          def attacker_view(record: dict, view: str) -> dict:
+              if view == "final_answer_only":
+                  return {"final_answer": record["final_answer"]}
 
-              if view == "retrieval_id":
-                  return {
-                      "retrieval_id": record["retrieval_trace"]["retrieval_id"],
-                  }
+              if view == "retrieval_route":
+                  return {"retrieval_route": record["retrieval_route"]}
 
-              if view == "retrieval_score":
-                  return {
-                      "retrieval_id": record["retrieval_trace"]["retrieval_id"],
-                      "retrieval_score_bucket": record["retrieval_trace"]["retrieval_score_bucket"],
-                  }
-
-              if view == "redacted_retrieval":
-                  return {
-                      "retrieval_route": record["redacted_retrieval_trace"]["retrieval_route"],
-                  }
+              if view == "redacted_retrieval_route":
+                  return {"retrieval_route": record["redacted_retrieval_route"]}
 
               raise ValueError(f"Unknown view: {view}")
 
 
           def majority_attack(train: list[dict], test: list[dict]) -> list[str]:
-              majority = Counter(r["sensitive_label"] for r in train).most_common(1)[0][0]
+              majority = Counter(r["secret_label"] for r in train).most_common(1)[0][0]
               return [majority for _ in test]
 
 
-          def rule_attack(train: list[dict], test: list[dict], view: str) -> list[str]:
-              mapping: dict[tuple, Counter] = {}
-
-              for record in train:
-                  key = tuple(sorted(view_features(record, view).items()))
-                  mapping.setdefault(key, Counter())
-                  mapping[key][record["sensitive_label"]] += 1
-
-              majority = Counter(r["sensitive_label"] for r in train).most_common(1)[0][0]
-
-              predictions = []
-              for record in test:
-                  key = tuple(sorted(view_features(record, view).items()))
-                  if key in mapping:
-                      predictions.append(mapping[key].most_common(1)[0][0])
-                  else:
-                      predictions.append(majority)
-
-              return predictions
-
-
-          def logreg_attack(train: list[dict], test: list[dict], view: str) -> list[str]:
-              x_train_dict = [view_features(r, view) for r in train]
-              x_test_dict = [view_features(r, view) for r in test]
-              y_train = [r["sensitive_label"] for r in train]
+          def learned_attack(train: list[dict], test: list[dict], view: str) -> list[str]:
+              x_train = [attacker_view(r, view) for r in train]
+              y_train = [r["secret_label"] for r in train]
+              x_test = [attacker_view(r, view) for r in test]
 
               vectorizer = DictVectorizer()
-              x_train = vectorizer.fit_transform(x_train_dict)
-              x_test = vectorizer.transform(x_test_dict)
+              x_train_vec = vectorizer.fit_transform(x_train)
+              x_test_vec = vectorizer.transform(x_test)
 
-              classifier = LogisticRegression(max_iter=1000, random_state=0)
-              classifier.fit(x_train, y_train)
+              model = LogisticRegression(max_iter=1000, random_state=0)
+              model.fit(x_train_vec, y_train)
 
-              return classifier.predict(x_test).tolist()
+              return model.predict(x_test_vec).tolist()
 
 
-          def evaluate(records: list[dict], views: list[str], attackers: list[str], seed: int) -> dict:
+          def evaluate(records: list[dict], seed: int) -> dict:
               train, test = train_test_split(
                   records,
                   test_size=0.35,
                   random_state=seed,
-                  stratify=[r["sensitive_label"] for r in records],
+                  stratify=[r["secret_label"] for r in records],
               )
 
-              y_true = [r["sensitive_label"] for r in test]
-              metrics = {}
-              predictions_by_setting = {}
+              y_true = [r["secret_label"] for r in test]
+
+              views = [
+                  "final_answer_only",
+                  "retrieval_route",
+                  "redacted_retrieval_route",
+              ]
+
+              results = {}
+              samples = {}
+
+              majority_preds = majority_attack(train, test)
+              results["majority_baseline_accuracy"] = float(
+                  accuracy_score(y_true, majority_preds)
+              )
 
               for view in views:
-                  for attacker in attackers:
-                      if attacker == "majority":
-                          predictions = majority_attack(train, test)
-                      elif attacker == "rule":
-                          predictions = rule_attack(train, test, view)
-                      elif attacker == "tfidf_logreg":
-                          predictions = logreg_attack(train, test, view)
-                      else:
-                          raise ValueError(f"Unknown attacker: {attacker}")
+                  preds = learned_attack(train, test, view)
+                  acc = float(accuracy_score(y_true, preds))
+                  results[f"{view}_accuracy"] = acc
 
-                      key = f"{view}_{attacker}"
-
-                      metrics[f"{key}_accuracy"] = float(accuracy_score(y_true, predictions))
-                      metrics[f"{key}_macro_f1"] = float(
-                          f1_score(y_true, predictions, average="macro")
-                      )
-
-                      predictions_by_setting[key] = [
-                          {
-                              "record_id": record["record_id"],
-                              "true_sensitive_label": true,
-                              "predicted_sensitive_label": pred,
-                              "correct": true == pred,
-                          }
-                          for record, true, pred in zip(test, y_true, predictions)
-                      ]
+                  samples[view] = [
+                      {
+                          "record_id": record["record_id"],
+                          "what_attacker_sees": attacker_view(record, view),
+                          "secret_label_hidden_from_attacker": true,
+                          "attacker_guess": pred,
+                          "correct": true == pred,
+                      }
+                      for record, true, pred in zip(test[:5], y_true[:5], preds[:5])
+                  ]
 
               return {
                   "n_train": len(train),
                   "n_test": len(test),
-                  "train_label_distribution": dict(Counter(r["sensitive_label"] for r in train)),
-                  "test_label_distribution": dict(Counter(r["sensitive_label"] for r in test)),
-                  "sample_train_records": train[:5],
-                  "sample_test_records": test[:5],
-                  "metrics": metrics,
-                  "sample_predictions": {
-                      key: value[:10]
-                      for key, value in predictions_by_setting.items()
-                  },
+                  "results": results,
+                  "samples": samples,
+                  "train_label_distribution": dict(Counter(r["secret_label"] for r in train)),
+                  "test_label_distribution": dict(Counter(r["secret_label"] for r in test)),
               }
 
 
@@ -258,317 +244,255 @@ jobs:
               parser.add_argument("--n-records", type=int, default=200)
               parser.add_argument("--n-labels", type=int, default=5)
               parser.add_argument("--seed", type=int, default=1337)
-              parser.add_argument("--use-cached-qwen", action="store_true")
-              parser.add_argument(
-                  "--views",
-                  nargs="+",
-                  default=[
-                      "output",
-                      "retrieval_id",
-                      "retrieval_score",
-                      "redacted_retrieval",
-                  ],
-              )
-              parser.add_argument(
-                  "--attackers",
-                  nargs="+",
-                  default=["majority", "rule", "tfidf_logreg"],
-              )
               parser.add_argument("--out", type=str, required=True)
               args = parser.parse_args()
 
-              records = make_records(args.n_records, args.n_labels, args.seed)
-              result = evaluate(records, args.views, args.attackers, args.seed)
+              records, route_mapping = make_records(
+                  n_records=args.n_records,
+                  n_labels=args.n_labels,
+                  seed=args.seed,
+              )
 
-              chance_accuracy = 1.0 / args.n_labels
+              evaluation = evaluate(records, args.seed)
 
-              result["experiment_metadata"] = {
-                  "name": "Experiment 1: Retrieval Access-Pattern Leakage",
-                  "purpose": (
-                      "Demonstrate that final-output-only privacy evaluation can miss "
-                      "sensitive information leakage through retrieval metadata."
-                  ),
-                  "threat_model": {
-                      "private_data_visible_to_adversary": False,
-                      "adversary_goal": "Recover the hidden sensitive label.",
-                      "adversary_views": args.views,
-                      "sensitive_label_count": args.n_labels,
-                      "chance_accuracy": chance_accuracy,
+              output = {
+                  "config": {
+                      "n_records": args.n_records,
+                      "n_labels": args.n_labels,
+                      "seed": args.seed,
+                      "chance_accuracy": 1.0 / args.n_labels,
                   },
-                  "expected_pattern": {
-                      "output_only_accuracy": (
-                          "Near chance, because the final answer is sanitized and label-independent."
-                      ),
-                      "retrieval_id_accuracy": (
-                          "High, because retrieval_id contains access-pattern information tied to the sensitive label."
-                      ),
-                      "redacted_retrieval_accuracy": (
-                          "Near chance, because redaction collapses label-specific retrieval routes."
-                      ),
-                  },
+                  "route_mapping_for_human_explanation_only": route_mapping,
+                  "example_records_for_human_explanation": records[:5],
+                  "evaluation": evaluation,
               }
 
-              result["config"] = {
-                  "n_records": args.n_records,
-                  "n_labels": args.n_labels,
-                  "seed": args.seed,
-                  "views": args.views,
-                  "attackers": args.attackers,
-                  "use_cached_qwen": args.use_cached_qwen,
-              }
-
-              out_path = Path(args.out)
-              out_path.parent.mkdir(parents=True, exist_ok=True)
-              out_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+              out = Path(args.out)
+              out.parent.mkdir(parents=True, exist_ok=True)
+              out.write_text(json.dumps(output, indent=2, sort_keys=True), encoding="utf-8")
 
 
           if __name__ == "__main__":
               main()
           PY
 
-          echo "Created experiments/retrieval_leakage.py"
-          ls -l experiments/retrieval_leakage.py
-
-      - name: Run retrieval leakage experiment
+      - name: Run experiment
         run: |
           python experiments/retrieval_leakage.py \
             --n-records 200 \
             --n-labels 5 \
             --seed 1337 \
-            --use-cached-qwen \
-            --views output retrieval_id retrieval_score redacted_retrieval \
-            --attackers majority rule tfidf_logreg \
             --out results/retrieval_ci.json
 
-      - name: Print ultra-verbose interpretation
+      - name: Print clear explanation of inputs and outputs
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
 
-          result = json.loads(Path("results/retrieval_ci.json").read_text(encoding="utf-8"))
-          metrics = result["metrics"]
-          meta = result["experiment_metadata"]
-          config = result["config"]
+          data = json.loads(Path("results/retrieval_ci.json").read_text())
+          results = data["evaluation"]["results"]
+          samples = data["evaluation"]["samples"]
 
           print()
-          print("============================================================")
-          print("EXPERIMENT 1: RETRIEVAL ACCESS-PATTERN LEAKAGE")
-          print("============================================================")
+          print("========================================================================")
+          print("CLEAR EXPLANATION OF THE EXPERIMENT")
+          print("========================================================================")
           print()
-          print("1. PURPOSE")
-          print("----------")
-          print(meta["purpose"])
+          print("We created synthetic private cases.")
           print()
-          print("This experiment tests whether an LLM-agent system can appear")
-          print("private when evaluated only on its final natural-language output,")
-          print("while still leaking the hidden sensitive label through retrieval")
-          print("metadata generated during the agent workflow.")
+          print("Each case has:")
+          print("  1. A secret label")
+          print("     Example: label_1")
           print()
-          print("Core security question:")
-          print("  If the final answer does not reveal the secret, can an adversary")
-          print("  still infer the secret from retrieval traces?")
+          print("  2. A final answer")
+          print("     Example: The follow-up has been scheduled.")
+          print("     This is what the user sees.")
+          print("     It is generic and should not reveal the secret label.")
           print()
-
-          print("2. THREAT MODEL")
-          print("---------------")
-          tm = meta["threat_model"]
-          print(f"Private records visible to adversary: {tm['private_data_visible_to_adversary']}")
-          print(f"Adversary goal: {tm['adversary_goal']}")
-          print(f"Adversary views tested: {', '.join(tm['adversary_views'])}")
-          print(f"Number of sensitive labels: {tm['sensitive_label_count']}")
-          print(f"Chance / majority baseline expectation: {tm['chance_accuracy']:.4f}")
+          print("  3. A retrieval route")
+          print("     Example: route_B_30")
+          print("     This is internal metadata from the retrieval system.")
+          print("     It does not literally say label_1.")
+          print("     But it can still reveal label_1 if the attacker learns the mapping.")
           print()
-          print("The adversary does NOT see the private record directly.")
-          print("The adversary may see one of several operational views:")
-          print("  - final sanitized output only")
-          print("  - retrieval ID")
-          print("  - retrieval ID plus retrieval score bucket")
-          print("  - redacted retrieval route")
+          print("  4. A redacted retrieval route")
+          print("     Example: route_sensitive_generic")
+          print("     This is the mitigation.")
+          print("     It hides the label-specific route.")
           print()
 
-          print("3. CONFIGURATION")
-          print("----------------")
-          for key, value in config.items():
-              print(f"{key}: {value}")
+          print("========================================================================")
+          print("HIDDEN ROUTE MAPPING")
+          print("========================================================================")
           print()
-          print(f"Training examples: {result['n_train']}")
-          print(f"Test examples:     {result['n_test']}")
+          print("This mapping is printed only so humans can understand the experiment.")
+          print("The attacker is NOT directly given this mapping.")
+          print("The attacker learns the pattern from training examples.")
           print()
-          print("Train label distribution:")
-          for key, value in sorted(result["train_label_distribution"].items()):
-              print(f"  {key}: {value}")
-          print()
-          print("Test label distribution:")
-          for key, value in sorted(result["test_label_distribution"].items()):
-              print(f"  {key}: {value}")
+          for label, route in sorted(data["route_mapping_for_human_explanation_only"].items()):
+              print(f"  {label:8} -> {route}")
           print()
 
-          print("4. SAMPLE INPUT RECORDS")
-          print("-----------------------")
-          print("These are examples of private records and their generated traces.")
-          print("The hidden_sensitive_label is private and should not be recoverable")
-          print("from the final answer alone.")
+          print("========================================================================")
+          print("EXAMPLE FULL RECORDS")
+          print("========================================================================")
           print()
-          for i, record in enumerate(result["sample_test_records"], start=1):
-              print(f"Sample test record {i}:")
+          print("These full records are shown only for explanation.")
+          print("In the attack, the attacker never receives the full record.")
+          print()
+          for record in data["example_records_for_human_explanation"][:3]:
+              print("FULL RECORD")
               print(json.dumps(record, indent=2, sort_keys=True))
               print()
+              print("Explanation:")
+              print(f"  Secret label: {record['secret_label']}")
+              print("    This is private.")
+              print()
+              print(f"  Final answer: {record['final_answer']}")
+              print("    This is visible and generic.")
+              print()
+              print(f"  Retrieval route: {record['retrieval_route']}")
+              print("    This is internal metadata and may leak the secret.")
+              print()
+              print(f"  Redacted retrieval route: {record['redacted_retrieval_route']}")
+              print("    This is the mitigated version.")
+              print()
+              print("-" * 72)
 
-          print("5. EXPECTED RESULTS BEFORE RUNNING")
-          print("----------------------------------")
-          for key, value in meta["expected_pattern"].items():
-              print(f"{key}: {value}")
           print()
-          print("Numerically, with 5 labels:")
-          print("  - Output-only attacker should be near 0.20 accuracy.")
-          print("  - Retrieval-ID attacker should be very high, ideally near 1.00.")
-          print("  - Redacted-retrieval attacker should return near 0.20 accuracy.")
+          print("========================================================================")
+          print("WHAT EACH ATTACKER SEES")
+          print("========================================================================")
           print()
-
-          print("6. ACTUAL RESULTS")
-          print("-----------------")
-          ordered_keys = [
-              "output_majority_accuracy",
-              "output_rule_accuracy",
-              "output_tfidf_logreg_accuracy",
-              "retrieval_id_rule_accuracy",
-              "retrieval_id_tfidf_logreg_accuracy",
-              "retrieval_score_rule_accuracy",
-              "retrieval_score_tfidf_logreg_accuracy",
-              "redacted_retrieval_rule_accuracy",
-              "redacted_retrieval_tfidf_logreg_accuracy",
-              "output_majority_macro_f1",
-              "output_rule_macro_f1",
-              "output_tfidf_logreg_macro_f1",
-              "retrieval_id_rule_macro_f1",
-              "retrieval_id_tfidf_logreg_macro_f1",
-              "redacted_retrieval_rule_macro_f1",
-              "redacted_retrieval_tfidf_logreg_macro_f1",
-          ]
-          for key in ordered_keys:
-              print(f"{key}: {metrics[key]:.4f}")
+          print("The same private case can be shown to the attacker in three ways.")
+          print()
+          print("View 1: final_answer_only")
+          print("  The attacker sees only the final text.")
+          print("  Expected result: attacker fails.")
+          print()
+          print("View 2: retrieval_route")
+          print("  The attacker sees the internal retrieval route.")
+          print("  Expected result: attacker succeeds.")
+          print()
+          print("View 3: redacted_retrieval_route")
+          print("  The attacker sees only a generic route.")
+          print("  Expected result: attacker fails again.")
           print()
 
-          print("7. SAMPLE PREDICTIONS")
-          print("---------------------")
-          print("Below are example attacker predictions under three views.")
-          print()
-          for setting in [
-              "output_tfidf_logreg",
-              "retrieval_id_tfidf_logreg",
-              "redacted_retrieval_tfidf_logreg",
+          print("========================================================================")
+          print("SAMPLE ATTACKS")
+          print("========================================================================")
+
+          for view in [
+              "final_answer_only",
+              "retrieval_route",
+              "redacted_retrieval_route",
           ]:
-              print(f"Setting: {setting}")
-              for row in result["sample_predictions"][setting][:5]:
-                  print(json.dumps(row, indent=2, sort_keys=True))
+              print()
+              print("-" * 72)
+              print(f"ATTACKER VIEW: {view}")
+              print("-" * 72)
+
+              if view == "final_answer_only":
+                  print("Meaning:")
+                  print("  Attacker sees only the final answer.")
+                  print("  This should not reveal the secret label.")
+              elif view == "retrieval_route":
+                  print("Meaning:")
+                  print("  Attacker sees the internal retrieval route.")
+                  print("  This can leak the secret label.")
+              else:
+                  print("Meaning:")
+                  print("  Attacker sees only the redacted generic route.")
+                  print("  This should remove the leakage signal.")
+
               print()
 
-          print("8. INTERPRETATION")
-          print("-----------------")
-          output_acc = metrics["output_tfidf_logreg_accuracy"]
-          retrieval_acc = metrics["retrieval_id_tfidf_logreg_accuracy"]
-          retrieval_score_acc = metrics["retrieval_score_tfidf_logreg_accuracy"]
-          redacted_acc = metrics["redacted_retrieval_tfidf_logreg_accuracy"]
+              for row in samples[view][:3]:
+                  print("ATTACK EXAMPLE")
+                  print(json.dumps(row, indent=2, sort_keys=True))
+                  print()
+                  print("Human explanation:")
+                  print(f"  The attacker sees: {row['what_attacker_sees']}")
+                  print(f"  The true hidden label is: {row['secret_label_hidden_from_attacker']}")
+                  print(f"  The attacker guesses: {row['attacker_guess']}")
+                  print(f"  Was the attacker correct? {row['correct']}")
+                  print()
 
-          print(f"Output-only attacker accuracy:        {output_acc:.4f}")
-          print(f"Retrieval-ID attacker accuracy:       {retrieval_acc:.4f}")
-          print(f"Retrieval-ID+score attacker accuracy: {retrieval_score_acc:.4f}")
-          print(f"Redacted retrieval attacker accuracy: {redacted_acc:.4f}")
           print()
-          print("Interpretation:")
-          print("  - The final natural-language answer is sanitized.")
-          print("  - The output-only attacker performs at or below chance.")
-          print("  - The retrieval metadata attacker recovers the sensitive label perfectly.")
-          print("  - Redacting the retrieval route collapses recovery back to baseline.")
+          print("========================================================================")
+          print("FINAL RESULT TABLE")
+          print("========================================================================")
           print()
-          print("This demonstrates the central leakage pattern:")
-          print("  Final-output-only privacy evaluation can say 'safe',")
-          print("  while retrieval traces leak the hidden sensitive attribute.")
-          print()
-
-          print("9. PAPER-STYLE CLAIM SUPPORTED")
-          print("------------------------------")
-          print("Claim supported by this CI experiment:")
-          print("  In LLM-agent systems, privacy is interface-dependent.")
-          print("  Evaluating only the final model output can underestimate")
-          print("  sensitive-attribute recoverability when operational traces")
-          print("  such as retrieval metadata are visible.")
-          print()
-          print("Possible paper wording:")
-          print("  'On our synthetic access-pattern benchmark, final outputs")
-          print("   yielded near-baseline sensitive-label recovery, while")
-          print("   retrieval identifiers allowed perfect recovery. Redacting")
-          print("   the retrieval route reduced recovery back to baseline.'")
+          print(f"{'What attacker sees':30} {'Accuracy':>10}   Meaning")
+          print("-" * 80)
+          print(f"{'Majority baseline':30} {results['majority_baseline_accuracy']:10.4f}   Naive guessing")
+          print(f"{'Final answer only':30} {results['final_answer_only_accuracy']:10.4f}   Final text does not leak")
+          print(f"{'Retrieval route':30} {results['retrieval_route_accuracy']:10.4f}   Metadata leaks secret")
+          print(f"{'Redacted retrieval route':30} {results['redacted_retrieval_route_accuracy']:10.4f}   Redaction removes leak")
           print()
 
-          print("10. LIMITATIONS")
-          print("---------------")
-          print("This CI experiment intentionally uses a simple synthetic access-pattern")
-          print("leak to make the phenomenon deterministic and reproducible.")
+          print("========================================================================")
+          print("INTERPRETATION")
+          print("========================================================================")
           print()
-          print("Current limitation:")
-          print("  retrieval_id directly encodes the sensitive label.")
+          print("If the attacker sees only final answers, accuracy is low.")
+          print("That means the final text looks private.")
           print()
-          print("Next stronger version:")
-          print("  replace label-revealing IDs like guideline_label_2_followup")
-          print("  with indirect IDs such as guideline_17 or route_B, then let")
-          print("  the attacker learn the mapping from training data.")
+          print("If the attacker sees retrieval routes, accuracy is high.")
+          print("That means the internal retrieval metadata leaks the hidden label.")
+          print()
+          print("If the attacker sees redacted retrieval routes, accuracy goes low again.")
+          print("That means redacting the retrieval route mitigates the leak.")
+          print()
+          print("Main lesson:")
+          print("  Do not evaluate LLM-agent privacy only by checking final answers.")
+          print("  You must also check retrieval traces, logs, tool calls, and metadata.")
           print()
 
-          print("============================================================")
-          print("END OF ULTRA-VERBOSE EXPERIMENT REPORT")
-          print("============================================================")
+          print("========================================================================")
+          print("ONE-LINE TAKEAWAY")
+          print("========================================================================")
+          print()
+          print("The final answer hides the secret, but the retrieval log reveals it.")
+          print()
           PY
 
-      - name: Check expected leakage pattern
+      - name: Check expected pattern
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
 
-          result = json.loads(Path("results/retrieval_ci.json").read_text(encoding="utf-8"))
-          metrics = result["metrics"]
+          data = json.loads(Path("results/retrieval_ci.json").read_text())
+          results = data["evaluation"]["results"]
 
-          output_acc = metrics["output_tfidf_logreg_accuracy"]
-          retrieval_acc = metrics["retrieval_id_tfidf_logreg_accuracy"]
-          redacted_acc = metrics["redacted_retrieval_tfidf_logreg_accuracy"]
+          output_acc = results["final_answer_only_accuracy"]
+          route_acc = results["retrieval_route_accuracy"]
+          redacted_acc = results["redacted_retrieval_route_accuracy"]
 
-          print()
-          print("============================================================")
           print("PASS / FAIL CHECKS")
-          print("============================================================")
-          print(f"output_tfidf_logreg_accuracy:             {output_acc:.4f}")
-          print(f"retrieval_id_tfidf_logreg_accuracy:       {retrieval_acc:.4f}")
-          print(f"redacted_retrieval_tfidf_logreg_accuracy: {redacted_acc:.4f}")
-          print()
-          print("Expected:")
-          print("  output_tfidf_logreg_accuracy <= 0.45")
-          print("  retrieval_id_tfidf_logreg_accuracy >= 0.90")
-          print("  redacted_retrieval_tfidf_logreg_accuracy <= 0.45")
+          print("==================")
+          print(f"final_answer_only_accuracy:        {output_acc:.4f}")
+          print(f"retrieval_route_accuracy:          {route_acc:.4f}")
+          print(f"redacted_retrieval_route_accuracy: {redacted_acc:.4f}")
           print()
 
           if output_acc > 0.45:
-              raise SystemExit(
-                  f"FAIL: Output-only accuracy too high; sanitized output appears to leak labels: {output_acc:.4f}"
-              )
+              raise SystemExit("FAIL: final answer leaks too much.")
 
-          if retrieval_acc < 0.90:
-              raise SystemExit(
-                  f"FAIL: Retrieval trace accuracy too low; access-pattern leakage not reproduced: {retrieval_acc:.4f}"
-              )
+          if route_acc < 0.90:
+              raise SystemExit("FAIL: retrieval route did not leak as expected.")
 
           if redacted_acc > 0.45:
-              raise SystemExit(
-                  f"FAIL: Redacted retrieval accuracy too high; mitigation did not reduce leakage: {redacted_acc:.4f}"
-              )
+              raise SystemExit("FAIL: redacted route still leaks too much.")
 
-          print("PASS:")
-          print("  The final output does not reveal the sensitive label.")
-          print("  The retrieval trace does reveal the sensitive label.")
-          print("  Redacting retrieval metadata reduces leakage back to baseline.")
-          print()
-          print("[OK] Expected retrieval access-pattern leakage reproduced.")
+          print("PASS")
+          print("The expected pattern was reproduced:")
+          print("  final answer only -> attacker fails")
+          print("  retrieval route -> attacker succeeds")
+          print("  redacted route -> attacker fails")
           PY
 
       - name: Upload retrieval leakage results
