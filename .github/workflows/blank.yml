@@ -1,0 +1,106 @@
+name: experiment-1-retrieval-leakage
+
+on:
+  push:
+    paths:
+      - "traceleaks/**"
+      - "experiments/retrieval_leakage.py"
+      - "scripts/check_expected.py"
+      - "requirements.txt"
+      - ".github/workflows/experiment1.yml"
+  pull_request:
+    paths:
+      - "traceleaks/**"
+      - "experiments/retrieval_leakage.py"
+      - "scripts/check_expected.py"
+      - "requirements.txt"
+      - ".github/workflows/experiment1.yml"
+  workflow_dispatch:
+
+jobs:
+  retrieval-leakage:
+    name: Run Experiment 1 - Retrieval Access-Pattern Leakage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      PYTHONHASHSEED: "0"
+      TOKENIZERS_PARALLELISM: "false"
+      TRACELEAKS_CI: "1"
+      TRACELEAKS_SEED: "1337"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Create results directory
+        run: |
+          mkdir -p results
+
+      - name: Run retrieval leakage experiment
+        run: |
+          python experiments/retrieval_leakage.py \
+            --n-records 200 \
+            --n-labels 5 \
+            --seed 1337 \
+            --use-cached-qwen \
+            --views output retrieval_id retrieval_score redacted_retrieval \
+            --attackers majority rule tfidf_logreg \
+            --out results/retrieval_ci.json
+
+      - name: Check expected retrieval leakage result
+        run: |
+          python scripts/check_expected.py \
+            --actual results/retrieval_ci.json \
+            --expected results/expected_retrieval_ci.json \
+            --tolerance 0.02
+
+      - name: Print experiment summary
+        run: |
+          python - <<'PY'
+          import json
+
+          with open("results/retrieval_ci.json", "r", encoding="utf-8") as f:
+              result = json.load(f)
+
+          print("\nExperiment 1: Retrieval Access-Pattern Leakage")
+          print("================================================")
+
+          metrics = result.get("metrics", result)
+
+          for key, value in metrics.items():
+              if isinstance(value, float):
+                  print(f"{key}: {value:.4f}")
+              else:
+                  print(f"{key}: {value}")
+
+          print("\n[OK] Experiment 1 completed successfully.")
+          PY
+
+      - name: Upload retrieval leakage results
+        uses: actions/upload-artifact@v4
+        with:
+          name: experiment-1-retrieval-leakage-results
+          path: |
+            results/retrieval_ci.json
+            results/expected_retrieval_ci.json
+          if-no-files-found: error
